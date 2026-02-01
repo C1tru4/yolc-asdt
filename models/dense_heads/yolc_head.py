@@ -149,6 +149,34 @@ class YOLCHead(BaseDenseHead, BBoxTestMixin):
 
         return points_list
 
+    def decode_xywh_to_bbox(self, xywh_pred, img_metas):
+        """Decode xywh predictions to bbox for KD comparison.
+        
+        Args:
+            xywh_pred (Tensor): xywh predictions with shape (B, 4, H, W)
+            img_metas (list[dict]): Image meta information
+            
+        Returns:
+            Tensor: Decoded bboxes with shape (B, H*W, 4) in [x, y, w/2, h/2] format
+        """
+        featmap_sizes = [xywh_pred.size()[-2:]]
+        device = xywh_pred.device
+        
+        # Get center points (same as in loss function)
+        center_points = self.prior_generator.grid_priors(
+            featmap_sizes, device=device, with_stride=False)[0]
+        
+        B, _, H, W = xywh_pred.shape
+        bbox_pred = xywh_pred.permute(0, 2, 3, 1).reshape(B, -1, 4)  # [B, H*W, 4]
+        
+        # Cast center_points to match xywh_pred dtype (避免 fp16/fp32 混合导致精度问题)
+        center_points = center_points.to(dtype=xywh_pred.dtype)
+        
+        # Add center points offset (same logic as in loss function)
+        bbox_pred[:, :, :2] = bbox_pred[:, :, :2] + center_points.unsqueeze(0)  # [B, HW, 2] + [1, HW, 2]
+        
+        return bbox_pred
+
     def forward(self, feats):
         """Forward features. Notice CenterNet head does not use FPN.
 
@@ -613,26 +641,49 @@ class YOLCHead(BaseDenseHead, BBoxTestMixin):
         else:
             return results_list
 
-    def LSM(self, center_heatmap_preds, img_metas):
+    def LSM(self, center_heatmap_preds, img_metas, visualize=False, subtract_border=False):
         '''
         Args:
             center_heatmap_preds (list[Tensor]):  (N, C, H, W)
+            img_metas (list[dict]): Image meta information
+            visualize (bool): Whether to save visualization images
+            subtract_border (bool): Whether to subtract border from coords (default: False)
         '''
         center_heatmap_pred = center_heatmap_preds[0]
-        locmap = torch.max(center_heatmap_pred, dim=1, keepdim=True)[0].cpu().numpy()
+        # 必须 detach()：如果 tensor requires_grad，不能直接 .numpy()
+        locmap = torch.max(center_heatmap_pred, dim=1, keepdim=True)[0].detach().cpu().numpy()
         
-        coord = self.findclusters(locmap, find_max=True, fname=["test"])
+        # 使用文件名生成唯一的 fname，避免可视化覆盖
+        # 只取 basename 避免路径分隔符导致保存失败
+        fname_list = []
+        for i in range(len(img_metas) if img_metas else 1):
+            if img_metas and i < len(img_metas):
+                fn = img_metas[i].get('ori_filename', img_metas[i].get('filename', f'img_{i}'))
+                fn = str(fn).split('/')[-1].split('\\')[-1]  # 去路径，只保留文件名
+            else:
+                fn = f'img_{i}'
+            fname_list.append(fn)
+        
+        coord = self.findclusters(locmap, find_max=True, fname=fname_list, visualize=visualize)
 
-        '''for visualization'''
-        border_pixs = [img_meta['border'] for img_meta in img_metas]
-        # coord [x, y, w, h]
-        coord[:, 0] = coord[:, 0] - border_pixs[0][2]
-        coord[:, 1] = coord[:, 1] - border_pixs[0][0]
+        # 只有在 subtract_border=True 时才减去 border（并确保 coord 不为空）
+        if subtract_border and coord is not None and len(coord) > 0:
+            border_pixs = [img_meta['border'] for img_meta in img_metas]
+            # coord [x, y, w, h]
+            coord[:, 0] = coord[:, 0] - border_pixs[0][2]
+            coord[:, 1] = coord[:, 1] - border_pixs[0][0]
         return coord
 
-    def findclusters(self, heatmap, find_max, fname):
+    def findclusters(self, heatmap, find_max, fname, visualize=False):
         heatmap = 1 - heatmap
-        heatmap = 255*heatmap / np.max(heatmap)
+        max_val = np.max(heatmap)
+        
+        # 如果 heatmap 接近全 0，直接返回空 coords（避免除零导致 NaN）
+        # 使用阈值判断而非严格 ==0（浮点数最佳实践）
+        if max_val < 1e-6:
+            return np.zeros((0, 4), dtype=np.int32)
+        
+        heatmap = 255*heatmap / max_val
         heatmap = heatmap[0][0]
 
         gray = heatmap.astype(np.uint8)
@@ -674,14 +725,24 @@ class YOLCHead(BaseDenseHead, BBoxTestMixin):
             y1 = item % 10
             grid[x1, y1] = 255
         result = split_overlay_map(grid)
+        
+        # 保护：如果 split_overlay_map 返回空或异常，返回空 coords
+        if result is None or len(result) == 0 or (isinstance(result, int) and result == 0):
+            return np.zeros((0, 4), dtype=np.int32)
+        
         result = np.array(result)
         result[:,0::2] = np.clip(result[:, 0::2]*w_stride, 0,  binary.shape[1])
         result[:,1::2] = np.clip(result[:, 1::2]*h_stride, 0,  binary.shape[0])
         
-        for i in range(len(result)):
-            cv2.rectangle(binary, (result[i, 0], result[i, 1]), (result[i, 2], result[i, 3]), (255, 0, 0), 2)
-
-        cv2.imwrite("binary_heatmap_%s4.jpg" %(fname[0]), binary)
+        # 只在 visualize=True 时保存可视化图片
+        if visualize:
+            for i in range(len(result)):
+                cv2.rectangle(binary, (result[i, 0], result[i, 1]), (result[i, 2], result[i, 3]), (255, 0, 0), 2)
+            # fname 已经在 LSM 中清理过路径，直接使用
+            vis_fname = fname[0] if fname and len(fname) > 0 else 'test'
+            # 去掉可能的文件扩展名，避免 .jpg.jpg
+            vis_fname = vis_fname.rsplit('.', 1)[0] if '.' in vis_fname else vis_fname
+            cv2.imwrite(f"binary_heatmap_{vis_fname}.jpg", binary)
 
         result[:, 2] = result[:, 2] - result[:, 0]
         result[:, 3] = result[:, 3] - result[:, 1]
@@ -695,8 +756,8 @@ def split_overlay_map(grid):
         :param grid: desnity mask to connect
         :return: merged regions for cropping purpose
     """
-    if grid is None or grid[0] is None:
-        return 0
+    if grid is None:
+        return []
     # Assume overlap_map is a 2d feature map
     m, n = grid.shape
     visit = [[0 for _ in range(n)] for _ in range(m)]

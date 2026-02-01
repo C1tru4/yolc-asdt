@@ -1,5 +1,15 @@
+# ========== Custom module imports (standard practice) ==========
+custom_imports = dict(
+    imports=[
+        'models.losses.gwd_loss',           # Import custom GWDLoss
+        'models.dense_heads.yolc_head',     # Import custom YOLCHead
+        'models.detectors.yolc',            # Import custom YOLC
+    ],
+    allow_failed_imports=False  # Report error immediately if import fails
+)
+
 dataset_type = 'VisDroneDataset'
-data_root = 'data/VisDrone2019/'
+data_root = 'd:/code/python/CenterNet_YOLC/YOLC/data/'
 classes = ('pedestrian', "people", "bicycle", "car", "van", "truck", "tricycle", "awning-tricycle", "bus", "motor")
 num_classes = 10
 img_norm_cfg = dict(
@@ -65,15 +75,15 @@ test_pipeline = [
         ])
 ]
 data = dict(
-    samples_per_gpu=4,
-    workers_per_gpu=4,
+    samples_per_gpu=1,  # Reduced to 1 for 8GB GPU memory limit
+    workers_per_gpu=0,  # Single process mode to avoid Windows multiprocessing issues
     train=dict(
         type='RepeatDataset',
         times=5,
         dataset = dict(type=dataset_type,
             classes=classes,
-            ann_file='data/Visdrone2019/VisDrone2019-DET_train_coco_1crop.json',
-            img_prefix='data/Visdrone2019/VisDrone2019-DET-train-crop/images',
+            ann_file='d:/code/python/CenterNet_YOLC/YOLC/data/VisDrone2019-DET_train_coco_1crop.json',
+            img_prefix='d:/code/python/CenterNet_YOLC/YOLC/data/VisDrone2019-DET-train-crop/images',
             pipeline=[
                 dict(
                     type='LoadImageFromFile',
@@ -107,8 +117,8 @@ data = dict(
     val=dict(
         type=dataset_type,
         classes=classes,
-        ann_file='data/Visdrone2019/VisDrone2019-DET_val_coco.json',
-        img_prefix='data/Visdrone2019/VisDrone2019-DET-val/images',
+        ann_file='d:/code/python/CenterNet_YOLC/YOLC/annotations/VisDrone2019-DET_val_coco.json',
+        img_prefix='d:/code/python/CenterNet_YOLC/YOLC/data/VisDrone2019-DET-val/images',
         pipeline=[
             dict(type='LoadImageFromFile', to_float32=True),
             dict(
@@ -145,8 +155,8 @@ data = dict(
     test=dict(
         type=dataset_type,
         classes=classes,
-        ann_file='data/Visdrone2019/VisDrone2019-DET_val_coco.json',
-        img_prefix='data/Visdrone2019/VisDrone2019-DET-val/images',
+        ann_file='d:/code/python/CenterNet_YOLC/YOLC/annotations/VisDrone2019-DET_val_coco.json',
+        img_prefix='d:/code/python/CenterNet_YOLC/YOLC/data/VisDrone2019-DET-val/images',
         pipeline=[
             dict(type='LoadImageFromFile', to_float32=True),
             dict(
@@ -191,13 +201,24 @@ lr_config = dict(
     step=[18, 24])
 runner = dict(type='EpochBasedRunner', max_epochs=48)
 checkpoint_config = dict(interval=1)
-log_config = dict(interval=50, hooks=[dict(type='TextLoggerHook')])
+log_config = dict(interval=20, hooks=[dict(type='TextLoggerHook')])  # More frequent logging for debugging
 custom_hooks = [dict(type='NumClassCheckHook')]
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
 load_from = None
 resume_from = None
 workflow = [('train', 1)]
+distill_cfg = dict(
+    enable=False,  # KD distillation disabled temporarily due to GPU memory limit (8GB)
+    teacher_ckpt='d:/code/python/CenterNet_YOLC/YOLC/work_dir/yolc_hrnet/epoch_1.pth',  # Teacher model path (using epoch_1)
+    kd_weight_global_hm=1.0,
+    kd_weight_global_coarse=1.0,
+    kd_weight_local_refine=1.0,
+    use_teacher_crop=True,
+    max_patches_per_img=4,
+    min_patch_size=64,
+    lsm_visualize=False,
+    lsm_add_border=False)  # Default False, enable after visualization confirmation
 model = dict(
     type='YOLC',
     backbone=dict(
@@ -245,6 +266,7 @@ model = dict(
         loss_center_local=dict(type='GaussianFocalLoss', loss_weight=1.0),
         loss_xywh=dict(type='GWDLoss', loss_weight=2.0)),
     train_cfg=None,
-    test_cfg=dict(topk=1000, local_maximum_kernel=3, max_per_img=300, nms_cfg=dict(iou_threshold=0.60)))
+    test_cfg=dict(topk=1000, local_maximum_kernel=3, max_per_img=300, nms_cfg=dict(iou_threshold=0.60)),
+    distill_cfg=distill_cfg)
 work_dir = './work_dir/yolc_hrnet'
-gpu_ids = range(0, 5)
+gpu_ids = range(0, 1)  # Fixed: current system has only 1 GPU

@@ -21,7 +21,8 @@ from mmdet.utils import (collect_env, get_device, get_root_logger,
                          replace_cfg_vals, setup_multi_processes,
                          update_data_root)
 
-from models import *
+# 注意：自定义模块通过 config 中的 custom_imports 导入，不再使用通配符导入
+# from models import *  # 已移除通配符导入
 from VisDrone_Dataset import VisDroneDataset
 
 def parse_args():

@@ -1,0 +1,558 @@
+方案1+要实现的效果是什么？
+
+你要保留 YOLC 的核心特点：
+
+全图粗检（global coarse）：在原图上跑一次，得到粗检测结果和热力图
+
+裁剪crop（crop/patch）：根据热力图找出重点区域，把原图裁剪出多个小图（patch）
+
+局部精检（local refine）：在每个 patch 上再跑一次检测，得到更精确的结果
+
+回贴到原图（remap/back-project）：把 patch 的检测框坐标加回偏移量，变回原图坐标
+
+融合（fusion）：把全图结果 + patch结果合并后做一次 NMS（非极大值抑制）输出最终检测
+
+同时加入我们 pipeline 的分工式KD（Knowledge Distillation，知识蒸馏）：
+
+Teacher（教师模型）：只做推理，不更新参数
+
+Student（学生模型）：你要训练的模型，会反向传播更新参数
+
+Global KD（全局蒸馏）：在原图上让 student 学 teacher 的“热力图 + coarse输出”
+
+Local KD（局部蒸馏）：在裁剪出的 patch 上让 student 学 teacher 的“refine输出”
+
+你需要改哪些文件（只改这三个就能跑通主流程）
+必改 1：YOLC/configs/yolc.py
+
+新增一个蒸馏配置（建议叫 distill_cfg），把所有开关和权重放进去，避免你以后到处改代码。
+
+建议字段（名字可变，但含义别变）：
+
+enable：是否启用蒸馏（True/False）
+
+teacher_ckpt：teacher 权重路径
+
+kd_weight_global_hm：全局热力图KD权重
+
+kd_weight_global_coarse：全局coarse KD权重
+
+kd_weight_local_refine：局部refine KD权重
+
+use_teacher_crop：裁剪框是否用 teacher 热力图生成（强烈建议 True）
+
+max_patches_per_img：每张图最多裁剪几个 patch（建议 2~6 起步）
+
+min_patch_size：过滤太小的 patch（比如 < 64 像素就丢弃）
+
+lsm_visualize：训练时是否保存 LSM 可视化（建议 False）
+
+必改 2：YOLC/models/detectors/yolc.py
+
+这是核心改动文件。你要在这里做四件大事：
+
+构建并加载 teacher（teacher只推理，不训练）
+
+forward_train 里同时跑 student 和 teacher，算 supervised loss + KD loss
+
+在训练时真的裁剪 patch，在 patch 上做局部KD（teacher patch vs student patch）
+
+在推理 simple_test 里加入“patch精检 + 回贴 + 融合”，保留YOLC特点（训练不一定要融合输出，但推理一定要做）
+
+必改 3：YOLC/models/dense_heads/yolc_head.py
+
+你要做两件小而关键的改动：
+
+给 LSM/findclusters 增加一个 visualize=False 开关，训练时默认不保存图片（否则训练会巨慢）
+
+增加一个“解码函数”（decode），让 KD 比较时 teacher/student 的框在同一坐标体系里（否则会对不齐）
+
+下面是“方案1+”的具体实现步骤（你可以直接交给 Cursor/Codex）
+第一步：在 detector 里加载 teacher（只推理，不更新）
+
+英文解释：
+
+eval()：评估模式（关闭 dropout 等随机层）
+
+requires_grad=False：不计算梯度，不参与反向传播（Backward）
+
+在 yolc.py 的 __init__ 里做：
+
+读取 distill_cfg
+
+用和 student 类似的方式 build 一个 teacher detector（通常 teacher 结构和 student 一样最省事）
+
+load checkpoint（加载权重）
+
+teacher.eval()
+
+冻结 teacher 参数：所有 p.requires_grad = False
+
+作用：teacher 训练过程中会“跑前向输出答案”，但不会被训练、不会更新。
+
+第二步：实现 forward_train：supervised loss + global KD + local KD（patch版）
+2.1 先跑 student（原图），算原本的监督损失（supervised loss）
+
+术语解释：
+
+supervised：有GT监督（Ground Truth，真实标注）
+
+loss dict：mmdet里用字典存多项loss，框架会自动加总并反传
+
+流程：
+
+feat_s = self.extract_feat(img)（特征提取）
+
+outs_s = self.bbox_head(feat_s)（得到 heatmap/coarse/refine 输出）
+
+losses = self.bbox_head.loss(*outs_s, gt_bboxes, gt_labels, img_metas, ...)
+
+这一步保持你原来逻辑不变。
+
+2.2 再跑 teacher（原图，不算梯度），得到 teacher 输出
+
+用：
+
+with torch.no_grad():（不记录梯度，省显存/省算力）
+
+流程：
+
+feat_t = self.teacher.extract_feat(img)
+
+outs_t = self.teacher.bbox_head(feat_t)
+
+2.3 计算 Global KD（全局蒸馏）：热力图 + coarse
+
+建议先用最简单稳定的 KD：MSE（均方误差）
+
+MSE（Mean Squared Error）：(a-b)^2 求平均，越小越像
+
+你做两项：
+
+loss_kd_global_hm：teacher heatmap vs student heatmap（原图范围）
+
+loss_kd_global_coarse：teacher coarse vs student coarse（原图范围）
+
+重要：coarse输出最好用“解码后”再比
+原因：你 head 里 coarse 预测是相对网格中心的偏移形式，直接比可能不在同一坐标体系。
+所以你在 yolc_head.py 加的 decode 函数这里就用上了。
+
+最后加到 losses：
+
+losses['loss_kd_global_hm'] = kd_hm * kd_weight_global_hm
+
+losses['loss_kd_global_coarse'] = kd_coarse * kd_weight_global_coarse
+
+第三步：用 teacher 热力图生成裁剪框 coords，然后“裁剪patch→patch精检→局部KD”
+
+这一步是方案1+的关键：局部KD不再只是mask版，而是“真的裁剪patch跑一次refine”。
+
+3.1 用 LSM 从 teacher heatmap 得到 crop 坐标（coords）
+
+术语解释：
+
+coords：裁剪框坐标，一般是 [x, y, w, h]（左上角+宽高）
+
+LSM：根据热力图找“目标密集区域/重点区域”的算法
+
+做法：
+
+从 outs_t 里取 teacher heatmap（通常是 center_local_preds 的第0层）
+
+调 self.teacher.bbox_head.LSM(center_heatmap_preds=..., img_metas=..., ...)
+
+得到每张图的 coords 列表
+
+加过滤：超过 max_patches_per_img 的只取前几个；小于 min_patch_size 的丢弃
+
+建议裁剪框来自 teacher（use_teacher_crop=True），因为 teacher 更稳定，学生早期预测不准会导致裁剪很差。
+
+3.2 裁剪 patch（不落盘，内存裁剪即可）
+
+你需要在 yolc.py 里写一个辅助函数（让 Cursor/Codex 写）：
+
+_crop_img_tensor(img_i, coord) -> img_patch
+
+img_i 是一张图的 tensor（形状一般是 [C,H,W]）
+
+coord 是 [x,y,w,h]
+
+注意要 clamp（裁剪到图像边界内，避免越界）
+
+英文解释：
+
+clamp：把数值限制在合法范围，比如 x<0 变 0，x>W 变 W
+
+3.3 构造 patch 的 img_metas（元信息）
+
+术语解释：
+
+img_metas：mmdet用来记录图像尺寸、缩放比例、pad等信息的字典
+
+你裁剪patch后，patch的尺寸变了，所以要更新 meta，否则解码框会错
+
+写辅助函数：
+
+_build_patch_meta(meta, patch_shape, coord) -> meta_patch
+
+更新 img_shape / pad_shape / ori_shape 之类字段（至少要让 head 的解码用对尺寸）
+
+给 meta_patch 增加 crop_offset=(x,y)（回贴用）
+
+新手建议：先做最简单：scale_factor=1.0，保证你裁剪的是当前输入尺度，不搞多级缩放。
+
+3.4 teacher 和 student 都在 patch 上跑一次（局部精检）
+
+流程（对每个 patch）：
+
+outs_s_patch = student(bbox_head(extract_feat(img_patch)))
+
+outs_t_patch = teacher(...)（no_grad）
+
+计算 local KD：建议只蒸馏 refine（精修框），最贴合“分工式”
+
+loss_kd_local_refine += MSE(decode(refine_s_patch), decode(refine_t_patch))
+
+最后：
+
+losses['loss_kd_local_refine'] = loss_kd_local_refine * kd_weight_local_refine
+
+注意：这里 local KD 的范围就是 patch 全区域，因为 patch 本身就是 ROI。
+
+第四步：把 patch 检测结果回贴到原图，并融合（推理必须做）
+
+你说的“YOLC特点：覆盖回原图”，主要体现在推理 simple_test。训练时做不做融合都行，但推理一定要做。
+
+4.1 回贴（Remap/Back-project）是什么意思？
+
+patch 上预测的 bbox 坐标是“以 patch 左上角为原点”的
+
+原图上应该加上偏移量 (x_offset, y_offset) 才能对齐原图坐标
+
+写辅助函数：
+
+_remap_bboxes_to_full(bboxes_patch, crop_offset)
+
+假设 bboxes_patch 是 [x1,y1,x2,y2]
+
+全部加上 offset：x1+=x_off, x2+=x_off, y1+=y_off, y2+=y_off
+
+4.2 融合（Fusion）+ NMS
+
+术语解释：
+
+Fusion（融合）：把“全图输出”和“所有patch输出”合并成一个列表
+
+NMS（Non-Maximum Suppression，非极大值抑制）：去掉重复框（重叠很大时保留分数最高的）
+
+推理 simple_test 里做：
+
+先跑全图 student，得到全图检测结果（原本就有）
+
+用热力图 LSM 得 coords（推理时可以用 student 或 teacher；如果部署不带teacher就用 student）
+
+对每个 coords 做 patch 精检，得到 patch 检测框与分数
+
+回贴 patch 框到原图坐标
+
+合并全图结果 + patch结果
+
+对合并结果做一次 NMS 输出最终结果
+
+这样就完整保留了“裁剪精检 + 回贴融合”的YOLC风格。
+
+给 Cursor/Codex 的“函数级任务清单”（非常适合直接复制）
+
+请让它在 YOLC/models/detectors/yolc.py 完成：
+
+在 __init__：
+
+读取 distill_cfg
+
+build teacher detector
+
+load teacher checkpoint
+
+teacher.eval() + 冻结参数
+
+新增/重写 forward_train(self, img, img_metas, gt_bboxes, gt_labels, **kwargs)：
+
+跑 student 原图 supervised loss
+
+跑 teacher 原图输出（no_grad）
+
+计算 global KD（heatmap+coarse）
+
+用 teacher heatmap 得 coords
+
+循环 coords：裁剪patch，构造patch meta，跑 teacher+student patch，计算 local KD（refine）
+
+把 KD loss 加入 loss dict 返回
+
+新增辅助函数：
+
+_crop_img_tensor(img_i, coord)
+
+_build_patch_meta(meta, patch_shape, coord)
+
+_remap_bboxes_to_full(bboxes_patch, offset)
+
+（可选）_run_detector_once(model, img_patch, meta_patch)（简化调用）
+
+修改 simple_test：
+
+全图检测一次
+
+LSM 得 coords
+
+patch 精检
+
+回贴 + 融合 + NMS
+
+并让它在 YOLC/models/dense_heads/yolc_head.py 完成：
+
+LSM/findclusters 增加 visualize=False 参数，训练默认 False
+
+增加 decode_xywh_to_bbox(...)（把 xywh 变成可比较 bbox，KD 用）
+
+新手最容易踩的坑（让 Cursor 重点注意）
+
+坐标尺度不一致
+LSM 输出 coords 是原图尺度还是特征图尺度一定要统一。建议让 Cursor 检查 LSM() 里有没有乘以 down_ratio、有没有用 img_metas 做缩放。最终 coords 必须能直接用于裁剪 img tensor。
+
+patch 的 img_metas 必须更新
+否则解码 bbox 会错，导致回贴位置乱。
+
+teacher 一定 no_grad + 冻结
+不然显存炸、训练变慢、还可能误更新 teacher。
+
+patch 数量别太多
+先 max_patches_per_img=2~4 起步，不然 teacher+student patch 前向开销很大。
+
+
+
+
+
+
+
+
+下面是在你已给 Cursor 的“方案1+修改清单”基础上，**额外补充：KD（知识蒸馏）损失的具体公式与实现细节**。我会尽量写成“不会踩坑”的版本，并标注哪些地方最容易错。
+
+---
+
+## 0）符号说明（全都用在下面公式里）
+
+* Teacher（教师模型）输出：上标 (t)
+* Student（学生模型）输出：上标 (s)
+* Heatmap（中心热力图）：
+
+  * teacher：(H^t \in \mathbb{R}^{B\times C\times H\times W})
+  * student：(H^s \in \mathbb{R}^{B\times C\times H\times W})
+* Coarse/Refine 的框参数（网络原始输出，和你代码里的 `xywh_pred_*`对应）：
+
+  * (X_c^t, X_c^s \in \mathbb{R}^{B\times 4\times H\times W})
+  * (X_r^t, X_r^s \in \mathbb{R}^{B\times 4\times H\times W})
+
+> 注意：YOLC 的 `loss()` 里会把 `xywh_pred_*` + `center_points` 变成“可比较的 bbox_pred”。KD 最容易错的点就是这里的“坐标体系”。
+
+---
+
+## 1）KD 的总损失（你最后加到 loss dict 的形式）
+
+总的 KD 损失分三块（对应你 pipeline）：
+
+[
+\mathcal{L}_{KD}
+================
+
+\lambda_{hm},\mathcal{L}*{KD}^{global_hm}
++
+\lambda*{c},\mathcal{L}*{KD}^{global_coarse}
++
+\lambda*{r},\mathcal{L}_{KD}^{local_refine}
+]
+
+* (\lambda_{hm} =) `kd_weight_global_hm`
+* (\lambda_{c} =) `kd_weight_global_coarse`
+* (\lambda_{r} =) `kd_weight_local_refine`
+
+---
+
+## 2）全局热力图蒸馏（Global heatmap KD）
+
+### 2.1 最稳的做法：对 sigmoid 后的概率做 MSE（均方误差）
+
+原因：你的 heatmap 通常是 logits（未 sigmoid），不同网络的 logit 绝对值尺度可能差很多；对 sigmoid 概率更稳。
+
+* **Sigmoid（S形函数）**：把任意实数变成 0~1 的概率
+  (\sigma(x)=\frac{1}{1+e^{-x}})
+
+公式：
+
+[
+P^t = \sigma(H^t),\quad P^s = \sigma(H^s)
+]
+
+[
+\mathcal{L}_{KD}^{global_hm}
+============================
+
+\frac{1}{BCHW}\sum_{b,c,i,j}\left(P^s_{b,c,i,j}-P^t_{b,c,i,j}\right)^2
+]
+
+**实现建议**（最少出错）：
+
+* `hm_t_prob = torch.sigmoid(hm_t.detach())`
+* `hm_s_prob = torch.sigmoid(hm_s)`
+* `kd_hm = F.mse_loss(hm_s_prob, hm_t_prob, reduction='mean')`
+
+> 如果你想更“蒸馏味”一点也可以用 KL（Kullback-Leibler），但新手更容易写错维度；MSE 足够稳定。
+
+---
+
+## 3）全局 coarse 蒸馏（Global coarse KD）
+
+### 3.1 强烈建议：用“解码后的 bbox”做蒸馏，而不是直接对 xywh_pred 做 MSE
+
+原因：你 head 的 `xywh_pred_*` 是相对网格中心点的偏移形式，直接比会因坐标基准不同导致“老师教错答案”。
+
+你在 `loss()` 里有类似逻辑（我用数学表达）：
+
+* 设网格中心点矩阵为 (C \in \mathbb{R}^{1\times 2\times H\times W})，复制到 batch 后与预测相加
+* 将 `xywh` 解码为 bbox 的一个常见形式是：
+
+  * 中心点：((x,y)= (dx,dy)+C)
+  * 宽高：(w,h)（或半宽半高）直接来自网络输出（可能有正值约束）
+
+你代码里最终比较的是某种 **bbox_pred**（flatten 到 (H!W)）。
+
+我建议你统一定义一个解码函数（Cursor 已经要加）：
+
+[
+B_c^t = decode(X_c^t),\quad B_c^s = decode(X_c^s)
+]
+其中 (B_c \in \mathbb{R}^{B\times HW \times 4})，四维可以是 ([x,y,w,h]) 或 ([x1,y1,x2,y2])，只要 teacher/student一致即可。
+
+然后做 MSE：
+
+[
+\mathcal{L}_{KD}^{global_coarse}
+================================
+
+\frac{1}{BHW\cdot 4}\sum_{b,k,d}\left(B_{c,b,k,d}^s-B_{c,b,k,d}^t\right)^2
+]
+
+**实现建议**：
+
+* `bbox_c_t = decode_xywh_to_bbox(xywh_c_t).detach()`
+* `bbox_c_s = decode_xywh_to_bbox(xywh_c_s)`
+* `kd_coarse = F.mse_loss(bbox_c_s, bbox_c_t, reduction='mean')`
+
+> 这里的 decode 必须与原 loss 使用的坐标体系一致：同样的 `center_points`、同样的 down_ratio/scale_factor 处理方式。
+
+---
+
+## 4）局部 refine 蒸馏（Local refine KD，patch 版）
+
+你现在做的是方案1+：**先裁剪 patch，再在 patch 上做 refine KD**。
+这时候“局部”其实就是“patch 全区域”，不需要再做 mask（因为 patch 本身就是 ROI）。
+
+### 4.1 patch refine KD 的公式（仍用解码后的 bbox 做 MSE）
+
+对每一个 patch (p)（一张图可能有多个 patch），teacher/student 在 patch 上输出 refine：
+
+[
+B_{r,p}^t = decode(X_{r,p}^t),\quad B_{r,p}^s = decode(X_{r,p}^s)
+]
+
+局部 refine 蒸馏：
+
+[
+\mathcal{L}_{KD}^{local_refine}
+===============================
+
+\frac{1}{N_p}\sum_{p=1}^{N_p}
+\left(
+\frac{1}{HW\cdot 4}\sum_{k,d}\left(B_{r,p,k,d}^s-B_{r,p,k,d}^t\right)^2
+\right)
+]
+
+其中 (N_p) 是总 patch 数（可以跨 batch 累加），建议对 patch 数做平均，避免 patch 多的 batch loss 更大。
+
+**实现建议**（最不容易错）：
+
+* 初始化 `kd_local_sum = 0`, `patch_cnt = 0`
+* 每个 patch：
+
+  * `bbox_r_t = decode(xywh_r_t_patch).detach()`
+  * `bbox_r_s = decode(xywh_r_s_patch)`
+  * `kd_local_sum += F.mse_loss(bbox_r_s, bbox_r_t, reduction='mean')`
+  * `patch_cnt += 1`
+* 最后：
+
+  * `kd_local = kd_local_sum / max(patch_cnt, 1)`
+
+---
+
+## 5）可选：让热力图 KD 更“像蒸馏”的 KL（有温度 T）
+
+你如果想更标准的蒸馏形式（有温度 Temperature），可以用 KL，但要小心维度。
+**温度 T**：把分布“变软”，让 teacher 的相对强弱更明显。
+
+做法：把 heatmap 当作每个像素位置的类别分布（对类别维 C 做 softmax）：
+
+[
+Q^t_{b,i,j} = softmax\left(\frac{H^t_{b,:,i,j}}{T}\right)
+]
+[
+Q^s_{b,i,j} = softmax\left(\frac{H^s_{b,:,i,j}}{T}\right)
+]
+
+KL 蒸馏：
+
+[
+\mathcal{L}_{KD}^{global_hm}
+============================
+
+T^2\cdot
+\frac{1}{BHW}\sum_{b,i,j}
+KL\left(Q^t_{b,i,j},|,Q^s_{b,i,j}\right)
+]
+
+> 新手更建议先用 “sigmoid后MSE”，稳定且不容易写错。KL 你要做也可以做，但先别同时蒸馏太多项。
+
+---
+
+## 6）强烈建议的“数值稳定/不出错”细节（Cursor 最该遵守）
+
+### 6.1 teacher 输出必须 `detach()` 或 `no_grad`
+
+* `with torch.no_grad():` 包 teacher 前向
+* 或 `teacher_tensor = teacher_tensor.detach()`
+  目的：防止梯度回到 teacher，节省显存，避免意外更新。
+
+### 6.2 KD 用 `reduction='mean'`
+
+避免 patch 数量不同导致 loss 尺度变化太大。
+局部 KD 记得再除以 patch 数。
+
+### 6.3 KD 的对象必须 teacher/student **同一形状**
+
+* heatmap：确保 `[B,C,H,W]`一致
+* bbox：decode 后确保 `[B,HW,4]`一致
+  patch 也一样。
+
+### 6.4 不要对 “未解码的 xywh” 做 KD（除非你100%确定坐标体系一致）
+
+这点最容易出错。你 head 的 `loss()` 已经暗示坐标变换流程，KD 要复用同样的 decode。
+
+---
+
+## 7）你最终在 loss dict 里加的三项（建议命名）
+
+* `loss_kd_global_hm = λ_hm * MSE(sigmoid(hm_s), sigmoid(hm_t))`
+* `loss_kd_global_coarse = λ_c * MSE(decode(coarse_s), decode(coarse_t))`
+* `loss_kd_local_refine = λ_r * average_over_patches( MSE(decode(refine_s_patch), decode(refine_t_patch)) )`
+
+这样既符合你“分工式KD”，也最不容易写错。
+

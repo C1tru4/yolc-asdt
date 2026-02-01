@@ -1,0 +1,31 @@
+﻿# 虚拟环境
+yolc_env/
+venv/
+env/
+*.venv
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.pyc
+
+# 模型权重
+*.pth
+*.ckpt
+
+# 日志和工作目录
+*.log
+*.log.json
+work_dir/
+
+# 数据集
+annotations/
+data/
+dataset/
+
+# IDE
+.vscode/
+.idea/
+
+# 系统文件
+.DS_Store
