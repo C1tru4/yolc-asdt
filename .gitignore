@@ -1,31 +1,35 @@
-﻿# 虚拟环境
+﻿# Python virtual env
 yolc_env/
 venv/
 env/
-*.venv
+.venv/
 
-# Python 缓存
+# Python caches
 __pycache__/
 *.py[cod]
-*.pyc
-
-# 模型权重
-*.pth
-*.ckpt
-
-# 日志和工作目录
-*.log
-*.log.json
-work_dir/
-
-# 数据集
-annotations/
-data/
-dataset/
 
 # IDE
 .vscode/
 .idea/
 
-# 系统文件
+# Logs / outputs
+*.log
+*.log.json
+work_dir/
+runs/
+wandb/
+
+# Model weights / checkpoints (usually too large for git)
+*.pth
+*.pt
+*.ckpt
+*.onnx
+
+# Datasets (keep out of git)
+data/
+dataset/
+annotations/
+
+# OS
 .DS_Store
+Thumbs.db
