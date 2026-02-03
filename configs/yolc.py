@@ -9,7 +9,7 @@ custom_imports = dict(
 )
 
 dataset_type = 'VisDroneDataset'
-data_root = 'd:/code/python/CenterNet_YOLC/YOLC/data/'
+data_root = '/root/yolc/yolc-asdt/data/'
 classes = ('pedestrian', "people", "bicycle", "car", "van", "truck", "tricycle", "awning-tricycle", "bus", "motor")
 num_classes = 10
 img_norm_cfg = dict(
@@ -75,15 +75,15 @@ test_pipeline = [
         ])
 ]
 data = dict(
-    samples_per_gpu=1,  # Reduced to 1 for 8GB GPU memory limit
+    samples_per_gpu=4,  # Batch size set to 4
     workers_per_gpu=0,  # Single process mode to avoid Windows multiprocessing issues
     train=dict(
         type='RepeatDataset',
-        times=5,
+        times=5,  # Repeat set to 5 for full training
         dataset = dict(type=dataset_type,
             classes=classes,
-            ann_file='d:/code/python/CenterNet_YOLC/YOLC/data/VisDrone2019-DET_train_coco_1crop.json',
-            img_prefix='d:/code/python/CenterNet_YOLC/YOLC/data/VisDrone2019-DET-train-crop/images',
+            ann_file='/root/yolc/yolc-asdt/data/VisDrone2019-DET_train_coco_1crop.json',
+            img_prefix='/root/yolc/yolc-asdt/data/VisDrone2019-DET-train-crop/images',
             pipeline=[
                 dict(
                     type='LoadImageFromFile',
@@ -117,8 +117,8 @@ data = dict(
     val=dict(
         type=dataset_type,
         classes=classes,
-        ann_file='d:/code/python/CenterNet_YOLC/YOLC/annotations/VisDrone2019-DET_val_coco.json',
-        img_prefix='d:/code/python/CenterNet_YOLC/YOLC/data/VisDrone2019-DET-val/images',
+        ann_file='/root/yolc/yolc-asdt/annotations/VisDrone2019-DET_val_coco.json',
+        img_prefix='/root/yolc/yolc-asdt/data/VisDrone2019-DET-val/images',
         pipeline=[
             dict(type='LoadImageFromFile', to_float32=True),
             dict(
@@ -155,8 +155,8 @@ data = dict(
     test=dict(
         type=dataset_type,
         classes=classes,
-        ann_file='d:/code/python/CenterNet_YOLC/YOLC/annotations/VisDrone2019-DET_val_coco.json',
-        img_prefix='d:/code/python/CenterNet_YOLC/YOLC/data/VisDrone2019-DET-val/images',
+        ann_file='/root/yolc/yolc-asdt/annotations/VisDrone2019-DET_val_coco.json',
+        img_prefix='/root/yolc/yolc-asdt/data/VisDrone2019-DET-val/images',
         pipeline=[
             dict(type='LoadImageFromFile', to_float32=True),
             dict(
@@ -191,26 +191,26 @@ data = dict(
                 ])
         ]))
 evaluation = dict(interval=1, metric='bbox')
-optimizer = dict(type='SGD', lr=0.00125*2, momentum=0.9, weight_decay=0.0001)
+optimizer = dict(type='SGD', lr=0.0005, momentum=0.9, weight_decay=0.0001)  # Learning rate set to 0.0005 for stability
 optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
 lr_config = dict(
     policy='step',
     warmup='linear',
-    warmup_iters=1000,
-    warmup_ratio=0.001,
+    warmup_iters=2000,  # Increased from 1000 to 2000 for more gradual warmup
+    warmup_ratio=0.0001,  # Decreased from 0.001 to 0.0001 for gentler start
     step=[18, 24])
-runner = dict(type='EpochBasedRunner', max_epochs=48)
+runner = dict(type='EpochBasedRunner', max_epochs=48)  # 完整训练48 epochs
 checkpoint_config = dict(interval=1)
 log_config = dict(interval=20, hooks=[dict(type='TextLoggerHook')])  # More frequent logging for debugging
 custom_hooks = [dict(type='NumClassCheckHook')]
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
 load_from = None
-resume_from = None
+resume_from = None  # Start fresh training with repeat=5
 workflow = [('train', 1)]
 distill_cfg = dict(
-    enable=False,  # KD distillation disabled temporarily due to GPU memory limit (8GB)
-    teacher_ckpt='d:/code/python/CenterNet_YOLC/YOLC/work_dir/yolc_hrnet/epoch_1.pth',  # Teacher model path (using epoch_1)
+    enable=False,  # 启用知识蒸馏
+    teacher_ckpt='/root/yolc/yolc-asdt/work_dir/yolc_hrnet/teacher.pth',  # Teacher model path
     kd_weight_global_hm=1.0,
     kd_weight_global_coarse=1.0,
     kd_weight_local_refine=1.0,
@@ -218,7 +218,8 @@ distill_cfg = dict(
     max_patches_per_img=4,
     min_patch_size=64,
     lsm_visualize=False,
-    lsm_add_border=False)  # Default False, enable after visualization confirmation
+    lsm_add_border=False,  # Default False, enable after visualization confirmation
+    kd_interval=2)  # Teacher每2个step执行一次蒸馏
 model = dict(
     type='YOLC',
     backbone=dict(

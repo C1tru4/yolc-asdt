@@ -60,6 +60,9 @@ class YOLC(SingleStageDetector):
         self.lsm_visualize = bool(self.distill_cfg.get('lsm_visualize', False))
         # lsm_add_border 默认 False，需要通过可视化确认 LSM coords 是否需要加 border
         self.lsm_add_border = bool(self.distill_cfg.get('lsm_add_border', False))
+        # kd_interval: teacher每N个step执行一次，默认1表示每个step都执行
+        self.kd_interval = int(self.distill_cfg.get('kd_interval', 1))
+        self.kd_step_counter = 0  # 用于跟踪当前step
 
     def train(self, mode=True):
         """保证 student 正常 train，但 teacher 永远 eval（不更新BN统计）。"""
@@ -343,6 +346,19 @@ class YOLC(SingleStageDetector):
             losses['kd_enable'] = img.new_tensor(0.0)
             return losses
 
+        # 检查是否应该在当前step执行蒸馏
+        self.kd_step_counter += 1
+        should_distill = (self.kd_step_counter % self.kd_interval == 0)
+        
+        if not should_distill:
+            # 不执行蒸馏，但添加零损失以保持日志格式统一
+            losses['loss_kd_global_hm'] = img.new_tensor(0.0)
+            losses['loss_kd_global_coarse'] = img.new_tensor(0.0)
+            losses['loss_kd_local_refine'] = img.new_tensor(0.0)
+            losses['kd_patch_cnt'] = img.new_tensor(0.0)
+            losses['kd_enable'] = img.new_tensor(0.0)  # 标记本step未执行KD
+            return losses
+
         with torch.no_grad():
             feat_t = self.teacher.extract_feat(img)
             outs_t = self.teacher.bbox_head(feat_t)
@@ -354,7 +370,7 @@ class YOLC(SingleStageDetector):
 
         bbox_c_s = self.bbox_head.decode_xywh_to_bbox(outs_s[1][0], img_metas)
         bbox_c_t = self.teacher.bbox_head.decode_xywh_to_bbox(outs_t[1][0], img_metas).detach()
-        kd_coarse = F.mse_loss(bbox_c_s, bbox_c_t, reduction='mean')
+        kd_coarse = F.smooth_l1_loss(bbox_c_s, bbox_c_t, reduction='mean', beta=50.0)
         losses['loss_kd_global_coarse'] = kd_coarse * self.kd_weight_global_coarse
 
         if self.use_teacher_crop:
@@ -383,7 +399,7 @@ class YOLC(SingleStageDetector):
 
                 bbox_r_s = self.bbox_head.decode_xywh_to_bbox(outs_s_patch[2][0], [meta_patch])
                 bbox_r_t = self.teacher.bbox_head.decode_xywh_to_bbox(outs_t_patch[2][0], [meta_patch]).detach()
-                kd_local_sum += F.mse_loss(bbox_r_s, bbox_r_t, reduction='mean')
+                kd_local_sum += F.smooth_l1_loss(bbox_r_s, bbox_r_t, reduction='mean', beta=50.0)
                 patch_cnt += 1
 
         if patch_cnt > 0:
